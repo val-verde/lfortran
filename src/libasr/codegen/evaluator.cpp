@@ -48,7 +48,11 @@
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Target/TargetOptions.h>
+#if LLVM_VERSION_MAJOR >= 14
+#include <llvm/MC/TargetRegistry.h>
+#else
 #include <llvm/Support/TargetRegistry.h>
+#endif
 #include <llvm/Support/Host.h>
 #include <libasr/codegen/KaleidoscopeJIT.h>
 
@@ -169,10 +173,7 @@ LLVMEvaluator::LLVMEvaluator(const std::string &t)
     llvm::TargetOptions opt;
     llvm::Optional<llvm::Reloc::Model> RM = llvm::Reloc::Model::PIC_;
     TM = target->createTargetMachine(target_triple, CPU, features, opt, RM);
-
-    // For some reason the JIT requires a different TargetMachine
-    llvm::TargetMachine *TM2 = llvm::EngineBuilder().selectTarget();
-    jit = std::make_unique<llvm::orc::KaleidoscopeJIT>(TM2);
+    jit = std::move(*llvm::orc::KaleidoscopeJIT::Create());
 
     _lfortran_stan(0.5);
 }
@@ -187,7 +188,7 @@ std::unique_ptr<llvm::Module> LLVMEvaluator::parse_module(const std::string &sou
 {
     llvm::SMDiagnostic err;
     std::unique_ptr<llvm::Module> module
-        = llvm::parseAssemblyString(source, err, *context);
+        = llvm::parseAssemblyString(source, err, get_context());
     if (!module) {
         throw LFortranException("parse_module(): Invalid LLVM IR");
     }
@@ -196,7 +197,7 @@ std::unique_ptr<llvm::Module> LLVMEvaluator::parse_module(const std::string &sou
         throw LFortranException("parse_module(): module failed verification.");
     };
     module->setTargetTriple(target_triple);
-    module->setDataLayout(jit->getTargetMachine().createDataLayout());
+    module->setDataLayout(jit->getDataLayout());
     return module;
 }
 
@@ -217,8 +218,8 @@ void LLVMEvaluator::add_module(std::unique_ptr<llvm::Module> mod) {
     // These are already set in parse_module(), but we set it here again for
     // cases when the Module was constructed directly, not via parse_module().
     mod->setTargetTriple(target_triple);
-    mod->setDataLayout(jit->getTargetMachine().createDataLayout());
-    jit->addModule(std::move(mod));
+    mod->setDataLayout(jit->getDataLayout());
+    jit->addModule(llvm::orc::ThreadSafeModule(std::move(mod), llvm::orc::ThreadSafeContext(std::move(context))));
 }
 
 void LLVMEvaluator::add_module(std::unique_ptr<LLVMModule> m) {
@@ -226,7 +227,7 @@ void LLVMEvaluator::add_module(std::unique_ptr<LLVMModule> m) {
 }
 
 intptr_t LLVMEvaluator::get_symbol_address(const std::string &name) {
-    llvm::JITSymbol s = jit->findSymbol(name);
+    llvm::JITSymbol s = *jit->lookup(name);
     if (!s) {
         throw std::runtime_error("findSymbol() failed to find the symbol '"
             + name + "'");
@@ -305,7 +306,7 @@ std::string LLVMEvaluator::get_asm(llvm::Module &m)
     llvm::CodeGenFileType ft = llvm::CGFT_AssemblyFile;
     llvm::SmallVector<char, 128> buf;
     llvm::raw_svector_ostream dest(buf);
-    if (jit->getTargetMachine().addPassesToEmitFile(pass, dest, nullptr, ft)) {
+    if (TM->addPassesToEmitFile(pass, dest, nullptr, ft)) {
         throw std::runtime_error("TargetMachine can't emit a file of this type");
     }
     pass.run(m);
